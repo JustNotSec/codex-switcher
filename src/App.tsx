@@ -21,6 +21,13 @@ import "./App.css";
 const THEME_STORAGE_KEY = "codex-switcher-theme";
 const AUTO_SWITCH_STORAGE_KEY = "codex-switcher-auto-switch";
 type ThemeMode = "light" | "dark";
+
+const tauriRuntimeAvailable = isTauriRuntime();
+const isMacOs =
+  typeof navigator !== "undefined" &&
+  /(Mac|iPhone|iPod|iPad)/i.test(navigator.userAgent);
+const showTitlebarControls = tauriRuntimeAvailable && !isMacOs;
+const appWindow = tauriRuntimeAvailable ? getCurrentWindow() : null;
 type AutoSwitchSettingsState = { enabled: boolean; thresholdPercent: number };
 const DEFAULT_AUTO_SWITCH: AutoSwitchSettingsState = {
   enabled: false,
@@ -52,10 +59,6 @@ const loadAutoSwitchSettings = (): AutoSwitchSettingsState => {
   }
   return DEFAULT_AUTO_SWITCH;
 };
-const appWindow = getCurrentWindow();
-const isMacOs =
-  typeof navigator !== "undefined" &&
-  /(Mac|iPhone|iPod|iPad)/i.test(navigator.userAgent);
 
 function App() {
   const {
@@ -144,14 +147,14 @@ function App() {
 
   const handleTitlebarDrag = useCallback(
     (event: React.MouseEvent<HTMLDivElement>) => {
-      if (!isTauriRuntime() || event.button !== 0) return;
+      if (!appWindow || event.button !== 0) return;
       void appWindow.startDragging();
     },
     []
   );
 
   const handleTitlebarDoubleClick = useCallback(() => {
-    if (!isTauriRuntime()) return;
+    if (!appWindow) return;
     void appWindow.toggleMaximize();
   }, []);
 
@@ -263,13 +266,14 @@ function App() {
   }, [themeMode]);
 
   useEffect(() => {
-    if (!isTauriRuntime() || isMacOs) return;
+    if (!appWindow || isMacOs) return;
+    const win = appWindow;
 
     let unlisten: (() => void) | undefined;
 
     const syncMaximizedState = async () => {
       try {
-        setIsWindowMaximized(await appWindow.isMaximized());
+        setIsWindowMaximized(await win.isMaximized());
       } catch (err) {
         console.error("Failed to read window state:", err);
       }
@@ -277,7 +281,7 @@ function App() {
 
     void syncMaximizedState();
 
-    appWindow
+    win
       .onResized(() => {
         void syncMaximizedState();
       })
@@ -611,17 +615,18 @@ function App() {
   return (
     <div className="min-h-screen bg-gray-50 text-gray-900 dark:bg-gray-950 dark:text-gray-100">
       <header className="sticky top-0 z-40 border-b border-gray-200 bg-white dark:border-gray-800 dark:bg-gray-900">
-        <div className="flex h-9 items-center bg-white px-3 dark:bg-gray-900">
-          <div
-            onMouseDown={handleTitlebarDrag}
-            onDoubleClick={handleTitlebarDoubleClick}
-            className={`h-full flex-1 select-none cursor-default ${isMacOs ? "ml-18 mr-2" : "mr-3"}`}
-          />
-          {!isMacOs && (
+        {tauriRuntimeAvailable && (
+          <div className="flex h-9 items-center bg-white px-3 dark:bg-gray-900">
+            <div
+              onMouseDown={handleTitlebarDrag}
+              onDoubleClick={handleTitlebarDoubleClick}
+              className={`h-full flex-1 select-none cursor-default ${isMacOs ? "ml-18 mr-2" : "mr-3"}`}
+            />
+          {showTitlebarControls && (
             <div className="flex items-center gap-1">
               <button
                 onClick={() => {
-                  void appWindow.minimize();
+                  void appWindow?.minimize();
                 }}
                 className="flex h-8 w-8 items-center justify-center rounded-md text-gray-500 transition-colors hover:bg-gray-100 hover:text-gray-900 dark:text-gray-400 dark:hover:bg-gray-800 dark:hover:text-gray-100"
                 title="Minimize"
@@ -632,7 +637,7 @@ function App() {
               </button>
               <button
                 onClick={() => {
-                  void appWindow.toggleMaximize();
+                  void appWindow?.toggleMaximize();
                 }}
                 className="flex h-8 w-8 items-center justify-center rounded-md text-gray-500 transition-colors hover:bg-gray-100 hover:text-gray-900 dark:text-gray-400 dark:hover:bg-gray-800 dark:hover:text-gray-100"
                 title={isWindowMaximized ? "Restore" : "Maximize"}
@@ -650,7 +655,7 @@ function App() {
               </button>
               <button
                 onClick={() => {
-                  void appWindow.close();
+                  void appWindow?.close();
                 }}
                 className="flex h-8 w-8 items-center justify-center rounded-md text-gray-500 transition-colors hover:bg-red-500 hover:text-white dark:text-gray-400 dark:hover:bg-red-500 dark:hover:text-white"
                 title="Close"
@@ -661,7 +666,8 @@ function App() {
               </button>
             </div>
           )}
-        </div>
+          </div>
+        )}
 
         <div className="max-w-5xl mx-auto px-6 py-4">
           <div className="grid grid-cols-1 gap-3 md:grid-cols-[minmax(0,1fr)_max-content] md:items-center md:gap-4">
