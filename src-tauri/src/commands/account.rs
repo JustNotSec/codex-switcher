@@ -302,23 +302,59 @@ fn find_antigravity_processes() -> anyhow::Result<Vec<u32>> {
 
     #[cfg(windows)]
     {
-        // Use tasklist on Windows
-        // For Windows we might need a more precise WMI query to get command line args,
-        // but for now we look for codex.exe PIDs and verify they're not ours
-        let output = std::process::Command::new("tasklist")
+        // Query command lines via WMI so we can distinguish Antigravity's
+        // app-server (the IDE plugin background) from a user's interactive
+        // codex.exe CLI session. tasklist alone returns only PIDs and would
+        // cause us to kill the user's running CLI session.
+        const PS_SCRIPT: &str = r#"
+Get-CimInstance Win32_Process |
+  Where-Object { $_.Name -ieq 'Codex.exe' -or $_.Name -ieq 'codex.exe' } |
+  ForEach-Object {
+    [PSCustomObject]@{
+      ProcessId = [uint32]$_.ProcessId
+      CommandLine = if ($_.CommandLine) { $_.CommandLine } else { '' }
+    }
+  } |
+  ConvertTo-Json -Compress
+"#;
+
+        let output = std::process::Command::new("powershell.exe")
             .creation_flags(CREATE_NO_WINDOW)
-            .args(["/FI", "IMAGENAME eq codex.exe", "/FO", "CSV", "/NH"])
+            .args(["-NoProfile", "-NonInteractive", "-Command", PS_SCRIPT])
             .output()?;
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        for line in stdout.lines() {
-            let parts: Vec<&str> = line.split(',').collect();
-            if parts.len() > 1 {
-                let name = parts[0].trim_matches('"').to_lowercase();
-                if name == "codex.exe" {
-                    let pid_str = parts[1].trim_matches('"');
-                    if let Ok(pid) = pid_str.parse::<u32>() {
-                        pids.push(pid);
+        if output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let trimmed = stdout.trim();
+            if !trimmed.is_empty() {
+                #[derive(serde::Deserialize)]
+                #[serde(rename_all = "PascalCase")]
+                struct WinProc {
+                    process_id: u32,
+                    #[serde(default)]
+                    command_line: String,
+                }
+
+                let entries: Vec<WinProc> =
+                    match serde_json::from_str::<serde_json::Value>(trimmed) {
+                        Ok(serde_json::Value::Array(values)) => values
+                            .into_iter()
+                            .filter_map(|v| serde_json::from_value::<WinProc>(v).ok())
+                            .collect(),
+                        Ok(value) => serde_json::from_value::<WinProc>(value)
+                            .map(|v| vec![v])
+                            .unwrap_or_default(),
+                        Err(_) => Vec::new(),
+                    };
+
+                for proc in entries {
+                    let command = proc.command_line.to_ascii_lowercase();
+                    let is_ide_plugin = command.contains(".antigravity")
+                        || command.contains("openai.chatgpt")
+                        || command.contains(".vscode");
+                    let is_app_server = command.contains("app-server");
+                    if is_ide_plugin && is_app_server {
+                        pids.push(proc.process_id);
                     }
                 }
             }

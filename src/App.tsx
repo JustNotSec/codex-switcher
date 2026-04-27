@@ -1,7 +1,14 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useAccounts } from "./hooks/useAccounts";
-import { AccountCard, AddAccountModal, UpdateChecker } from "./components";
+import { useAutoSwitch } from "./hooks/useAutoSwitch";
+import {
+  AccountCard,
+  AddAccountModal,
+  AutoSwitchSettings,
+  MassAddModal,
+  UpdateChecker,
+} from "./components";
 import type { CodexProcessInfo } from "./types";
 import {
   exportFullBackupFile,
@@ -12,7 +19,39 @@ import {
 import "./App.css";
 
 const THEME_STORAGE_KEY = "codex-switcher-theme";
+const AUTO_SWITCH_STORAGE_KEY = "codex-switcher-auto-switch";
 type ThemeMode = "light" | "dark";
+type AutoSwitchSettingsState = { enabled: boolean; thresholdPercent: number };
+const DEFAULT_AUTO_SWITCH: AutoSwitchSettingsState = {
+  enabled: false,
+  thresholdPercent: 90,
+};
+const loadAutoSwitchSettings = (): AutoSwitchSettingsState => {
+  if (typeof window === "undefined") return DEFAULT_AUTO_SWITCH;
+  try {
+    const raw = window.localStorage.getItem(AUTO_SWITCH_STORAGE_KEY);
+    if (!raw) return DEFAULT_AUTO_SWITCH;
+    const parsed = JSON.parse(raw);
+    if (
+      parsed &&
+      typeof parsed === "object" &&
+      typeof parsed.enabled === "boolean" &&
+      typeof parsed.thresholdPercent === "number" &&
+      Number.isFinite(parsed.thresholdPercent)
+    ) {
+      return {
+        enabled: parsed.enabled,
+        thresholdPercent: Math.min(
+          99,
+          Math.max(50, Math.round(parsed.thresholdPercent))
+        ),
+      };
+    }
+  } catch {
+    // fall through
+  }
+  return DEFAULT_AUTO_SWITCH;
+};
 const appWindow = getCurrentWindow();
 const isMacOs =
   typeof navigator !== "undefined" &&
@@ -42,6 +81,7 @@ function App() {
   } = useAccounts();
 
   const [isAddModalOpen, setIsAddModalOpen] = useState(false);
+  const [isMassAddModalOpen, setIsMassAddModalOpen] = useState(false);
   const [isConfigModalOpen, setIsConfigModalOpen] = useState(false);
   const [configModalMode, setConfigModalMode] = useState<"slim_export" | "slim_import">(
     "slim_export"
@@ -65,6 +105,9 @@ function App() {
     isError: boolean;
   } | null>(null);
   const [maskedAccounts, setMaskedAccounts] = useState<Set<string>>(new Set());
+  const [stalePidsAfterSwitch, setStalePidsAfterSwitch] = useState<Set<number>>(
+    new Set()
+  );
   const [otherAccountsSort, setOtherAccountsSort] = useState<
     | "deadline_asc"
     | "deadline_desc"
@@ -85,6 +128,19 @@ function App() {
     }
   });
   const [isWindowMaximized, setIsWindowMaximized] = useState(false);
+  const [autoSwitchSettings, setAutoSwitchSettings] =
+    useState<AutoSwitchSettingsState>(loadAutoSwitchSettings);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(
+        AUTO_SWITCH_STORAGE_KEY,
+        JSON.stringify(autoSwitchSettings)
+      );
+    } catch {
+      // ignore storage errors
+    }
+  }, [autoSwitchSettings]);
 
   const handleTitlebarDrag = useCallback(
     (event: React.MouseEvent<HTMLDivElement>) => {
@@ -154,6 +210,25 @@ function App() {
     return () => clearInterval(interval);
   }, [checkProcesses]);
 
+  // Drop stale PIDs once their codex CLI sessions exit
+  useEffect(() => {
+    if (!processInfo) return;
+    setStalePidsAfterSwitch((prev) => {
+      if (prev.size === 0) return prev;
+      const current = new Set(processInfo.pids);
+      const next = new Set<number>();
+      let removed = false;
+      for (const pid of prev) {
+        if (current.has(pid)) {
+          next.add(pid);
+        } else {
+          removed = true;
+        }
+      }
+      return removed ? next : prev;
+    });
+  }, [processInfo]);
+
   // Load masked accounts from storage on mount
   useEffect(() => {
     loadMaskedAccountIds().then((ids) => {
@@ -222,14 +297,38 @@ function App() {
     // Check processes before switching
     const latestProcessInfo = await checkProcesses();
     if (latestProcessInfo && !latestProcessInfo.can_switch) {
+      showWarmupToast(
+        "Tidak bisa switch: codex CLI sedang jalan. Exit codex dulu.",
+        true
+      );
       return;
     }
+
+    const preSwitchPids = latestProcessInfo?.pids ?? [];
+    const target = accounts.find((a) => a.id === accountId);
+    const targetName = target?.name ?? "account";
 
     try {
       setSwitchingId(accountId);
       await switchAccount(accountId);
+
+      if (preSwitchPids.length > 0) {
+        setStalePidsAfterSwitch(new Set(preSwitchPids));
+      }
+
+      const after = await checkProcesses();
+      const remainingCount = after?.pids.length ?? preSwitchPids.length;
+      if (remainingCount > 0) {
+        showWarmupToast(
+          `Switched to ${targetName}. Restart codex CLI untuk pakai akun baru.`
+        );
+      } else {
+        showWarmupToast(`Switched to ${targetName}.`);
+      }
     } catch (err) {
       console.error("Failed to switch account:", err);
+      const msg = err instanceof Error ? err.message : String(err);
+      showWarmupToast(`Switch gagal: ${msg}`, true);
     } finally {
       setSwitchingId(null);
     }
@@ -266,6 +365,15 @@ function App() {
     setWarmupToast({ message, isError });
     setTimeout(() => setWarmupToast(null), 2500);
   };
+
+  const { isPending: autoSwitchPending, pendingTargetName: autoSwitchPendingTarget } =
+    useAutoSwitch({
+      accounts,
+      processInfo,
+      settings: autoSwitchSettings,
+      switchAccount,
+      onToast: showWarmupToast,
+    });
 
   const formatWarmupError = (err: unknown) => {
     if (!err) return "Unknown error";
@@ -645,7 +753,7 @@ function App() {
                   Account ▾
                 </button>
                 {isActionsMenuOpen && (
-                  <div className="absolute right-0 z-50 mt-2 w-56 rounded-xl border border-gray-200 bg-white p-2 text-gray-700 shadow-xl dark:border-neutral-800 dark:bg-black dark:text-white">
+                  <div className="animate-slide-in-down absolute right-0 z-50 mt-2 w-64 rounded-xl border border-gray-200 bg-white p-2 text-gray-700 shadow-xl dark:border-neutral-800 dark:bg-black dark:text-white">
                     <button
                       onClick={() => {
                         setIsActionsMenuOpen(false);
@@ -654,6 +762,15 @@ function App() {
                       className="w-full rounded-lg px-3 py-2 text-left text-sm transition-colors hover:bg-gray-100 dark:text-white dark:hover:bg-neutral-900"
                     >
                       + Add Account
+                    </button>
+                    <button
+                      onClick={() => {
+                        setIsActionsMenuOpen(false);
+                        setIsMassAddModalOpen(true);
+                      }}
+                      className="w-full rounded-lg px-3 py-2 text-left text-sm transition-colors hover:bg-gray-100 dark:text-white dark:hover:bg-neutral-900"
+                    >
+                      ✦ Mass Add Accounts
                     </button>
                     <button
                       onClick={() => {
@@ -695,6 +812,11 @@ function App() {
                     >
                       {isImportingFull ? "Importing..." : "Import Full Encrypted File"}
                     </button>
+                    <AutoSwitchSettings
+                      enabled={autoSwitchSettings.enabled}
+                      thresholdPercent={autoSwitchSettings.thresholdPercent}
+                      onChange={setAutoSwitchSettings}
+                    />
                   </div>
                 )}
               </div>
@@ -702,6 +824,96 @@ function App() {
           </div>
         </div>
       </header>
+
+      {autoSwitchPending && (
+        <div className="animate-slide-in-down border-b border-sky-200/70 bg-sky-50/80 backdrop-blur-sm dark:border-sky-700/40 dark:bg-sky-900/20">
+          <div className="mx-auto flex max-w-5xl items-center gap-3 px-6 py-2.5">
+            <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-sky-100 text-sky-700 dark:bg-sky-800/60 dark:text-sky-200">
+              <svg
+                className="h-3.5 w-3.5 animate-pulse"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2.2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              >
+                <circle cx="12" cy="12" r="9" />
+                <path d="M12 7v5l3 2" />
+              </svg>
+            </span>
+            <div className="flex-1 text-xs text-sky-900 dark:text-sky-100">
+              <span className="font-semibold">Auto-switch tertunda</span>
+              <span className="text-sky-700/80 dark:text-sky-200/70">
+                {" "}
+                — akan pindah ke{" "}
+              </span>
+              <span className="font-semibold">{autoSwitchPendingTarget}</span>
+              <span className="text-sky-700/80 dark:text-sky-200/70">
+                {" "}
+                setelah sesi Codex selesai.
+              </span>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {stalePidsAfterSwitch.size > 0 && (
+        <div className="animate-slide-in-down border-b border-amber-200/70 bg-amber-50/80 backdrop-blur-sm dark:border-amber-700/40 dark:bg-amber-900/20">
+          <div className="mx-auto flex max-w-5xl items-center gap-3 px-6 py-2.5">
+            <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-amber-100 text-amber-700 dark:bg-amber-800/60 dark:text-amber-200">
+              <svg
+                className="h-3.5 w-3.5"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2.2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              >
+                <path d="M12 9v4" />
+                <path d="M12 17h.01" />
+                <path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0Z" />
+              </svg>
+            </span>
+            <div className="flex-1 text-xs text-amber-900 dark:text-amber-100">
+              <span className="font-semibold">
+                {stalePidsAfterSwitch.size} sesi codex CLI pakai auth lama
+              </span>
+              <span className="text-amber-700/80 dark:text-amber-200/70">
+                {" "}
+                — exit & jalankan ulang{" "}
+              </span>
+              <code className="rounded bg-amber-100 px-1 py-0.5 font-mono text-[11px] text-amber-900 dark:bg-amber-800/60 dark:text-amber-100">
+                codex
+              </code>
+              <span className="text-amber-700/80 dark:text-amber-200/70">
+                {" "}
+                untuk pakai akun baru.
+              </span>
+            </div>
+            <button
+              type="button"
+              onClick={() => setStalePidsAfterSwitch(new Set())}
+              className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-amber-700 transition-colors hover:bg-amber-100 dark:text-amber-200 dark:hover:bg-amber-800/40"
+              aria-label="Dismiss"
+              title="Dismiss"
+            >
+              <svg
+                className="h-3.5 w-3.5"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2.2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              >
+                <path d="M18 6 6 18M6 6l12 12" />
+              </svg>
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* Main Content */}
       <main className="max-w-5xl mx-auto px-6 py-8">
@@ -846,28 +1058,82 @@ function App() {
 
       {/* Refresh Success Toast */}
       {refreshSuccess && (
-        <div className="fixed bottom-6 left-1/2 -translate-x-1/2 px-4 py-3 bg-green-600 text-white rounded-lg shadow-lg text-sm flex items-center gap-2">
-          <span>✓</span> Usage refreshed successfully
+        <div className="animate-fade-slide-up fixed bottom-6 left-1/2 z-50 flex -translate-x-1/2 items-center gap-2 rounded-xl border border-emerald-400/40 bg-emerald-500/95 px-4 py-2.5 text-sm font-medium text-white shadow-lg backdrop-blur-sm">
+          <svg
+            className="h-4 w-4"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2.5"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          >
+            <path d="M20 6 9 17l-5-5" />
+          </svg>
+          Usage refreshed
         </div>
       )}
 
       {/* Warm-up Toast */}
       {warmupToast && (
         <div
-          className={`fixed bottom-20 left-1/2 -translate-x-1/2 px-4 py-3 rounded-lg shadow-lg text-sm ${
+          className={`animate-fade-slide-up fixed bottom-20 left-1/2 z-50 flex max-w-md -translate-x-1/2 items-start gap-2.5 rounded-xl px-4 py-3 text-sm shadow-lg backdrop-blur-sm ${
             warmupToast.isError
-              ? "bg-red-600 text-white"
-              : "bg-amber-100 text-amber-900 border border-amber-300 dark:bg-amber-900/30 dark:text-amber-200 dark:border-amber-700"
+              ? "border border-red-400/40 bg-red-500/95 text-white"
+              : "border border-gray-200 bg-white/95 text-gray-800 dark:border-neutral-700 dark:bg-neutral-900/95 dark:text-gray-100"
           }`}
         >
-          {warmupToast.message}
+          <span
+            className={`mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center ${
+              warmupToast.isError
+                ? "text-white"
+                : "text-emerald-600 dark:text-emerald-400"
+            }`}
+          >
+            {warmupToast.isError ? (
+              <svg
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2.5"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              >
+                <circle cx="12" cy="12" r="10" />
+                <path d="M12 8v4M12 16h.01" />
+              </svg>
+            ) : (
+              <svg
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2.5"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              >
+                <path d="M20 6 9 17l-5-5" />
+              </svg>
+            )}
+          </span>
+          <span className="leading-snug">{warmupToast.message}</span>
         </div>
       )}
 
       {/* Delete Confirmation Toast */}
       {deleteConfirmId && (
-        <div className="fixed bottom-6 left-1/2 -translate-x-1/2 px-4 py-3 bg-red-600 text-white rounded-lg shadow-lg text-sm">
-          Click delete again to confirm removal
+        <div className="animate-fade-slide-up fixed bottom-6 left-1/2 z-50 flex -translate-x-1/2 items-center gap-2 rounded-xl border border-red-400/40 bg-red-500/95 px-4 py-2.5 text-sm font-medium text-white shadow-lg backdrop-blur-sm">
+          <svg
+            className="h-4 w-4"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2.5"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          >
+            <path d="M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6" />
+          </svg>
+          Click delete again to confirm
         </div>
       )}
 
@@ -876,6 +1142,16 @@ function App() {
         isOpen={isAddModalOpen}
         onClose={() => setIsAddModalOpen(false)}
         onImportFile={importFromFile}
+        onStartOAuth={startOAuthLogin}
+        onCompleteOAuth={completeOAuthLogin}
+        onCancelOAuth={cancelOAuthLogin}
+      />
+
+      {/* Mass Add Modal */}
+      <MassAddModal
+        isOpen={isMassAddModalOpen}
+        onClose={() => setIsMassAddModalOpen(false)}
+        accounts={accounts}
         onStartOAuth={startOAuthLogin}
         onCompleteOAuth={completeOAuthLogin}
         onCancelOAuth={cancelOAuthLogin}
